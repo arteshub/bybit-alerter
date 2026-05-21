@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -101,11 +102,21 @@ func (b *BybitClient) FetchAvgTurnover(ctx context.Context, sym Symbol, days int
 		if err == nil {
 			return avg, nil
 		}
+		// No point retrying if the symbol simply has no historical data yet.
+		var noData errNoData
+		if errors.As(err, &noData) {
+			return 0, err
+		}
 		lastErr = err
 	}
 
 	return 0, fmt.Errorf("%s: after %d retries: %w", sym, len(delays), lastErr)
 }
+
+// errNoData is returned when there are no closed candles available (not retryable).
+type errNoData struct{ sym Symbol }
+
+func (e errNoData) Error() string { return string(e.sym) + ": no closed candle data available" }
 
 func (b *BybitClient) fetchAvgTurnoverOnce(sym Symbol, days int) (float64, error) {
 	limit := days + 1 // +1 because the first item is the current unclosed candle
@@ -121,10 +132,12 @@ func (b *BybitClient) fetchAvgTurnoverOnce(sym Symbol, days int) (float64, error
 
 	list := resp.Result.List
 	if len(list) < 2 {
-		return 0, fmt.Errorf("insufficient kline data: got %d items", len(list))
+		// New listing with no closed candles yet — not a transient error, skip immediately.
+		return 0, errNoData{sym}
 	}
 
 	// list[0] is the current (possibly unclosed) candle – discard it.
+	// Use however many closed candles are available (may be fewer than days for new listings).
 	closed := list[1:]
 	var sum float64
 	for _, item := range closed {
