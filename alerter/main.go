@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"fmt"
+
 	"volume_pump_checker/internal/alert"
 	"volume_pump_checker/internal/config"
 	"volume_pump_checker/internal/exchange"
@@ -126,16 +128,20 @@ func main() {
 }
 
 func loadAverages(ctx context.Context, client *exchange.BybitClient, vs *store.VolumeStore, symbols []exchange.Symbol, cfg *config.Config) {
-	for _, sym := range symbols {
+	total := len(symbols)
+	for i, sym := range symbols {
 		if ctx.Err() != nil {
 			return
 		}
 		avg, err := client.FetchAvgTurnover(ctx, sym, cfg.LookbackDays)
 		if err != nil {
 			slog.Warn("fetch avg failed, skipping", "symbol", sym, "error", err)
-			continue
+		} else {
+			vs.Set(sym, avg)
 		}
-		vs.Set(sym, avg)
+		if (i+1)%50 == 0 || i+1 == total {
+			slog.Info("loading averages", "progress", fmt.Sprintf("%d/%d", i+1, total))
+		}
 		time.Sleep(time.Duration(cfg.RESTDelayMS) * time.Millisecond)
 	}
 }
