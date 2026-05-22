@@ -176,66 +176,84 @@ func (b *BybitClient) AddSubscriptions(ctx context.Context, symbols []Symbol, ha
 }
 
 // openConnections creates one WS connection per wsConnSymbols batch.
+// Each connection auto-reconnects on failure until ctx is cancelled.
 func (b *BybitClient) openConnections(ctx context.Context, symbols []Symbol, handler func(Candle)) error {
 	for i := 0; i < len(symbols); i += wsConnSymbols {
 		end := i + wsConnSymbols
 		if end > len(symbols) {
 			end = len(symbols)
 		}
-		batch := symbols[i:end]
-
-		svc, err := b.ws.V5().Public(bybit.CategoryV5Linear)
-		if err != nil {
-			return fmt.Errorf("create ws public service: %w", err)
-		}
-
-		klineHandler := func(resp bybit.V5WebsocketPublicKlineResponse) error {
-			key := resp.Key()
-			sym := Symbol(key.Symbol)
-			for _, d := range resp.Data {
-				turnover, err := strconv.ParseFloat(d.Turnover, 64)
-				if err != nil {
-					return fmt.Errorf("parse ws turnover %q: %w", d.Turnover, err)
-				}
-				handler(Candle{
-					Symbol:   sym,
-					Turnover: turnover,
-					Date:     time.UnixMilli(d.Start).UTC().Format("2006-01-02"),
-					IsClosed: d.Confirm,
-				})
-			}
-			return nil
-		}
-
-		for j := 0; j < len(batch); j += wsSubBatch {
-			jEnd := j + wsSubBatch
-			if jEnd > len(batch) {
-				jEnd = len(batch)
-			}
-			keys := make([]bybit.V5WebsocketPublicKlineParamKey, 0, jEnd-j)
-			for _, sym := range batch[j:jEnd] {
-				keys = append(keys, bybit.V5WebsocketPublicKlineParamKey{
-					Interval: bybit.IntervalD,
-					Symbol:   bybit.SymbolV5(sym),
-				})
-			}
-			if _, err := svc.SubscribeKlines(keys, klineHandler); err != nil {
-				return fmt.Errorf("subscribe klines: %w", err)
-			}
-		}
+		batch := make([]Symbol, end-i)
+		copy(batch, symbols[i:end])
 
 		b.wg.Add(1)
-		go func(svc bybit.V5WebsocketPublicServiceI) {
+		go func(batch []Symbol) {
 			defer b.wg.Done()
-			errHandler := bybit.ErrHandler(func(isClosed bool, err error) {
-				slog.Error("ws public error", "closed", isClosed, "error", err)
-			})
-			if err := svc.Start(ctx, errHandler); err != nil {
-				slog.Error("ws public service exited", "error", err)
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				err := b.runConnection(ctx, batch, handler)
+				if ctx.Err() != nil {
+					return
+				}
+				slog.Warn("ws connection dropped, reconnecting in 5s", "error", err, "symbols", len(batch))
+				select {
+				case <-time.After(5 * time.Second):
+				case <-ctx.Done():
+					return
+				}
 			}
-		}(svc)
+		}(batch)
 	}
 	return nil
+}
+
+func (b *BybitClient) runConnection(ctx context.Context, batch []Symbol, handler func(Candle)) error {
+	svc, err := b.ws.V5().Public(bybit.CategoryV5Linear)
+	if err != nil {
+		return fmt.Errorf("create ws public service: %w", err)
+	}
+
+	klineHandler := func(resp bybit.V5WebsocketPublicKlineResponse) error {
+		key := resp.Key()
+		sym := Symbol(key.Symbol)
+		for _, d := range resp.Data {
+			turnover, err := strconv.ParseFloat(d.Turnover, 64)
+			if err != nil {
+				return fmt.Errorf("parse ws turnover %q: %w", d.Turnover, err)
+			}
+			handler(Candle{
+				Symbol:   sym,
+				Turnover: turnover,
+				Date:     time.UnixMilli(d.Start).UTC().Format("2006-01-02"),
+				IsClosed: d.Confirm,
+			})
+		}
+		return nil
+	}
+
+	for j := 0; j < len(batch); j += wsSubBatch {
+		jEnd := j + wsSubBatch
+		if jEnd > len(batch) {
+			jEnd = len(batch)
+		}
+		keys := make([]bybit.V5WebsocketPublicKlineParamKey, 0, jEnd-j)
+		for _, sym := range batch[j:jEnd] {
+			keys = append(keys, bybit.V5WebsocketPublicKlineParamKey{
+				Interval: bybit.IntervalD,
+				Symbol:   bybit.SymbolV5(sym),
+			})
+		}
+		if _, err := svc.SubscribeKlines(keys, klineHandler); err != nil {
+			return fmt.Errorf("subscribe klines: %w", err)
+		}
+	}
+
+	errHandler := bybit.ErrHandler(func(isClosed bool, err error) {
+		slog.Warn("ws error", "closed", isClosed, "error", err)
+	})
+	return svc.Start(ctx, errHandler)
 }
 
 // Start blocks until all WebSocket goroutines have exited.
