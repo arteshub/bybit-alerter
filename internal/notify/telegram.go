@@ -153,14 +153,22 @@ func (t *TelegramNotifier) handleUpdate(ctx context.Context, upd tgUpdate) {
 		}
 		slog.Info("new subscriber", "chatID", chatID, "multiplier", t.defaultMult)
 		_ = t.sendMessage(ctx, chatID, fmt.Sprintf(
-			"✅ <b>Bybit Volume Alerter</b>\n\nПодписан! Текущий порог: <b>x%.1f</b>\n\nКоманды:\n/multiplier 5.0 — изменить порог\n/settings — текущие настройки\n/stop — отписаться",
+			"✅ <b>Bybit Volume Alerter</b>\n\nПодписан! Множитель: <b>x%.1f</b>\n\nКоманды:\n/multiplier — текущий множитель\n/multiplier 5.0 — изменить\n/stop — отписаться",
 			t.defaultMult,
 		))
 
 	case strings.HasPrefix(text, "/multiplier"):
 		parts := strings.Fields(text)
-		if len(parts) != 2 {
-			_ = t.sendMessage(ctx, chatID, "Использование: /multiplier 5.0")
+		if len(parts) == 1 {
+			u, err := t.userRepo.Find(ctx, chatID)
+			if err != nil {
+				_ = t.sendMessage(ctx, chatID, "Ты не подписан. Напиши /start")
+				return
+			}
+			_ = t.sendMessage(ctx, chatID, fmt.Sprintf(
+				"Текущий множитель: <b>x%.1f</b>\n\nЧтобы изменить: /multiplier 5.0",
+				u.VolumeMultiplier,
+			))
 			return
 		}
 		var mult float64
@@ -174,18 +182,7 @@ func (t *TelegramNotifier) handleUpdate(ctx context.Context, upd tgUpdate) {
 			return
 		}
 		slog.Info("user updated multiplier", "chatID", chatID, "multiplier", mult)
-		_ = t.sendMessage(ctx, chatID, fmt.Sprintf("✅ Порог обновлён: <b>x%.1f</b>", mult))
-
-	case text == "/settings":
-		u, err := t.userRepo.Find(ctx, chatID)
-		if err != nil {
-			_ = t.sendMessage(ctx, chatID, "Ты не подписан. Напиши /start")
-			return
-		}
-		_ = t.sendMessage(ctx, chatID, fmt.Sprintf(
-			"⚙️ <b>Настройки</b>\nПорог: <b>x%.1f</b>\nЛукбек: <b>%d дней</b>",
-			u.VolumeMultiplier, t.lookbackDays,
-		))
+		_ = t.sendMessage(ctx, chatID, fmt.Sprintf("✅ Множитель обновлён: <b>x%.1f</b>", mult))
 
 	case text == "/stop":
 		if err := t.userRepo.Delete(ctx, chatID); err != nil {
