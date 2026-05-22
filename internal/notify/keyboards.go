@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	multOptions = []float64{2, 3, 5, 7, 10, 15}
+	multOptions = []float64{5, 10, 15, 20, 30, 40, 50}
 	daysOptions = []int{30, 60, 90}
 )
 
