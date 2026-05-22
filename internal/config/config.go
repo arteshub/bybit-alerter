@@ -8,6 +8,7 @@ import (
 
 type Config struct {
 	TGBotToken       string
+	DatabaseURL      string
 	VolumeMultiplier float64
 	LookbackDays     int
 	RESTDelayMS      int
@@ -27,6 +28,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TG_BOT_TOKEN is required")
 	}
 	cfg.TGBotToken = token
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required")
+	}
+	cfg.DatabaseURL = dbURL
 
 	if v := os.Getenv("VOLUME_MULTIPLIER"); v != "" {
 		m, err := strconv.ParseFloat(v, 64)

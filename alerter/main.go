@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -9,9 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"fmt"
+	gormpg "gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
-	"volume_pump_checker/internal/alert"
+	"volume_pump_checker/application"
+	pgrepo "volume_pump_checker/infrastructure/postgres"
 	"volume_pump_checker/internal/config"
 	"volume_pump_checker/internal/exchange"
 	"volume_pump_checker/internal/notify"
@@ -32,10 +36,21 @@ func main() {
 	}
 	slog.SetDefault(slog.New(logHandler))
 
-	client := exchange.NewBybitClient(cfg.RESTDelayMS)
+	db, err := gorm.Open(gormpg.Open(cfg.DatabaseURL), &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	})
+	if err != nil {
+		log.Fatalf("db connect: %v", err)
+	}
+	if err := pgrepo.Migrate(db); err != nil {
+		log.Fatalf("db migrate: %v", err)
+	}
+
+	userRepo := pgrepo.NewUserRepository(db)
 	vs := store.NewVolumeStore()
-	checker := alert.NewChecker(vs, cfg.VolumeMultiplier)
-	notifier := notify.NewTelegramNotifier(cfg.TGBotToken, cfg.LookbackDays)
+	client := exchange.NewBybitClient(cfg.RESTDelayMS)
+	notifier := notify.NewTelegramNotifier(cfg.TGBotToken, cfg.LookbackDays, cfg.VolumeMultiplier, userRepo)
+	alertSvc := application.NewAlertService(userRepo, vs, notifier)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -54,30 +69,11 @@ func main() {
 	slog.Info("averages loaded", "count", len(symbols), "duration", time.Since(loadStart).Round(time.Second))
 
 	candleHandler := func(candle exchange.Candle) {
-		fired, err := checker.Check(ctx, candle)
-		if err != nil {
-			slog.Error("checker error", "symbol", candle.Symbol, "error", err)
-			return
-		}
-		if !fired {
-			return
-		}
-		avg, _ := vs.Get(candle.Symbol)
-		slog.Info("alert fired",
-			"symbol", candle.Symbol,
-			"turnover", candle.Turnover,
-			"avg", avg,
-			"ratio", candle.Turnover/avg,
-		)
-		if err := notifier.Send(ctx, candle, avg); err != nil {
-			slog.Error("notify send error", "error", err)
-		}
+		alertSvc.Handle(ctx, candle)
 	}
 
-	// currentSymbols tracks the live set for daily diff.
 	currentSymbols := symbols
 
-	// Daily refresh: 00:05 UTC — diff symbols, update store + WS subscriptions.
 	go func() {
 		for {
 			now := time.Now().UTC()

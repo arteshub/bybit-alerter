@@ -6,6 +6,7 @@ import (
 	"volume_pump_checker/internal/exchange"
 )
 
-type Notifier interface {
-	Send(ctx context.Context, candle exchange.Candle, avg float64) error
+// Sender delivers an alert for a specific chat ID.
+type Sender interface {
+	SendToUser(ctx context.Context, chatID int64, candle exchange.Candle, avg float64) error
 }
