@@ -16,32 +16,44 @@ import (
 	"volume_pump_checker/internal/exchange"
 )
 
+var (
+	multOptions = []float64{2, 3, 5, 7, 10, 15}
+	daysOptions = []int{30, 60, 90}
+)
+
 type userPayload struct {
-	chatID int64
-	candle exchange.Candle
-	avg    float64
+	chatID       int64
+	candle       exchange.Candle
+	avg          float64
+	lookbackDays int
+}
+
+type inlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+type inlineKeyboard struct {
+	InlineKeyboard [][]inlineButton `json:"inline_keyboard"`
 }
 
 // TelegramNotifier handles alert delivery and bot command processing.
-// Users register via /start and configure their threshold via /multiplier.
 type TelegramNotifier struct {
-	token        string
-	lookbackDays int
-	defaultMult  float64
-	userRepo     user.Repository
-	queue        chan userPayload
-	offset       atomic.Int64
-	client       *http.Client
+	token       string
+	defaultMult float64
+	userRepo    user.Repository
+	queue       chan userPayload
+	offset      atomic.Int64
+	client      *http.Client
 }
 
-func NewTelegramNotifier(token string, lookbackDays int, defaultMult float64, userRepo user.Repository) *TelegramNotifier {
+func NewTelegramNotifier(token string, defaultMult float64, userRepo user.Repository) *TelegramNotifier {
 	return &TelegramNotifier{
-		token:        token,
-		lookbackDays: lookbackDays,
-		defaultMult:  defaultMult,
-		userRepo:     userRepo,
-		queue:        make(chan userPayload, 1024),
-		client:       &http.Client{Timeout: 15 * time.Second},
+		token:       token,
+		defaultMult: defaultMult,
+		userRepo:    userRepo,
+		queue:       make(chan userPayload, 1024),
+		client:      &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
@@ -50,10 +62,9 @@ func (t *TelegramNotifier) Start(ctx context.Context) {
 	go t.pollUpdates(ctx)
 }
 
-// SendToUser enqueues an alert for a specific chat ID.
-func (t *TelegramNotifier) SendToUser(_ context.Context, chatID int64, candle exchange.Candle, avg float64) error {
+func (t *TelegramNotifier) SendToUser(_ context.Context, chatID int64, candle exchange.Candle, avg float64, lookbackDays int) error {
 	select {
-	case t.queue <- userPayload{chatID: chatID, candle: candle, avg: avg}:
+	case t.queue <- userPayload{chatID: chatID, candle: candle, avg: avg, lookbackDays: lookbackDays}:
 	default:
 		slog.Warn("telegram queue full, dropping alert", "symbol", candle.Symbol, "chatID", chatID)
 	}
@@ -64,8 +75,7 @@ func (t *TelegramNotifier) worker(ctx context.Context) {
 	for {
 		select {
 		case p := <-t.queue:
-			text := t.formatMessage(p.candle, p.avg)
-			if err := t.sendMessage(ctx, p.chatID, text); err != nil {
+			if err := t.sendMessage(ctx, p.chatID, t.formatAlert(p), nil); err != nil {
 				slog.Error("telegram send error", "chatID", p.chatID, "error", err)
 			}
 			time.Sleep(50 * time.Millisecond)
@@ -73,8 +83,7 @@ func (t *TelegramNotifier) worker(ctx context.Context) {
 			for {
 				select {
 				case p := <-t.queue:
-					text := t.formatMessage(p.candle, p.avg)
-					_ = t.sendMessage(context.Background(), p.chatID, text)
+					_ = t.sendMessage(context.Background(), p.chatID, t.formatAlert(p), nil)
 					time.Sleep(50 * time.Millisecond)
 				default:
 					return
@@ -84,16 +93,77 @@ func (t *TelegramNotifier) worker(ctx context.Context) {
 	}
 }
 
-// --- Bot update polling ---
+// --- keyboards ---
+
+func settingsMenu(u *user.User) (string, inlineKeyboard) {
+	text := fmt.Sprintf(
+		"⚙️ <b>Настройки</b>\n\nМножитель: <b>x%.0f</b>\nПериод: <b>%d дн.</b>",
+		u.VolumeMultiplier, u.LookbackDays,
+	)
+	kb := inlineKeyboard{InlineKeyboard: [][]inlineButton{
+		{{Text: "📊 Множитель", CallbackData: "mult"}, {Text: "📅 Период", CallbackData: "days"}},
+		{{Text: "🚫 Отписаться", CallbackData: "stop"}},
+	}}
+	return text, kb
+}
+
+func multMenu(current float64) (string, inlineKeyboard) {
+	var rows [][]inlineButton
+	var row []inlineButton
+	for i, m := range multOptions {
+		label := fmt.Sprintf("x%.0f", m)
+		if m == current {
+			label = "✅ " + label
+		}
+		row = append(row, inlineButton{Text: label, CallbackData: fmt.Sprintf("mult:%d", int(m))})
+		if len(row) == 3 || i == len(multOptions)-1 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	rows = append(rows, []inlineButton{{Text: "◀️ Назад", CallbackData: "settings"}})
+	return "📊 <b>Множитель объёма</b>\n\nАлерт срабатывает когда оборот превышает среднее в N раз:", inlineKeyboard{InlineKeyboard: rows}
+}
+
+func daysMenu(current int) (string, inlineKeyboard) {
+	var row []inlineButton
+	for _, d := range daysOptions {
+		label := fmt.Sprintf("%d дн.", d)
+		if d == current {
+			label = "✅ " + label
+		}
+		row = append(row, inlineButton{Text: label, CallbackData: fmt.Sprintf("days:%d", d)})
+	}
+	kb := inlineKeyboard{InlineKeyboard: [][]inlineButton{
+		row,
+		{{Text: "◀️ Назад", CallbackData: "settings"}},
+	}}
+	return "📅 <b>Период усреднения</b>\n\nСреднее считается за выбранное количество дней:", kb
+}
+
+// --- update polling ---
+
+type tgMessage struct {
+	MessageID int64 `json:"message_id"`
+	Chat      struct {
+		ID int64 `json:"id"`
+	} `json:"chat"`
+	Text string `json:"text"`
+}
+
+type tgCallbackQuery struct {
+	ID   string `json:"id"`
+	From struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+	Message tgMessage `json:"message"`
+	Data    string    `json:"data"`
+}
 
 type tgUpdate struct {
-	UpdateID int64 `json:"update_id"`
-	Message  struct {
-		Chat struct {
-			ID int64 `json:"id"`
-		} `json:"chat"`
-		Text string `json:"text"`
-	} `json:"message"`
+	UpdateID      int64            `json:"update_id"`
+	Message       *tgMessage       `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
 }
 
 func (t *TelegramNotifier) pollUpdates(ctx context.Context) {
@@ -109,7 +179,7 @@ func (t *TelegramNotifier) pollUpdates(ctx context.Context) {
 
 func (t *TelegramNotifier) fetchUpdates(ctx context.Context) {
 	url := fmt.Sprintf(
-		"https://api.telegram.org/bot%s/getUpdates?timeout=10&offset=%d&allowed_updates=%%5B%%22message%%22%%5D",
+		"https://api.telegram.org/bot%s/getUpdates?timeout=10&offset=%d&allowed_updates=%%5B%%22message%%22%%2C%%22callback_query%%22%%5D",
 		t.token, t.offset.Load(),
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -141,69 +211,128 @@ func (t *TelegramNotifier) fetchUpdates(ctx context.Context) {
 }
 
 func (t *TelegramNotifier) handleUpdate(ctx context.Context, upd tgUpdate) {
-	chatID := upd.Message.Chat.ID
-	text := strings.TrimSpace(upd.Message.Text)
+	if upd.CallbackQuery != nil {
+		t.handleCallback(ctx, upd.CallbackQuery)
+		return
+	}
+	if upd.Message == nil || strings.TrimSpace(upd.Message.Text) != "/start" {
+		return
+	}
 
-	switch {
-	case text == "/start":
-		u := user.New(chatID, t.defaultMult)
+	chatID := upd.Message.Chat.ID
+
+	u, err := t.userRepo.Find(ctx, chatID)
+	if err != nil {
+		u = user.New(chatID, t.defaultMult, user.DefaultLookbackDays)
 		if err := t.userRepo.Upsert(ctx, u); err != nil {
 			slog.Error("bot: upsert user", "error", err)
 			return
 		}
-		slog.Info("new subscriber", "chatID", chatID, "multiplier", t.defaultMult)
-		_ = t.sendMessage(ctx, chatID, fmt.Sprintf(
-			"✅ <b>Bybit Volume Alerter</b>\n\nПодписан! Множитель: <b>x%.1f</b>\n\nКоманды:\n/multiplier — текущий множитель\n/multiplier 5.0 — изменить\n/stop — отписаться",
-			t.defaultMult,
-		))
+		slog.Info("new subscriber", "chatID", chatID)
+	}
 
-	case strings.HasPrefix(text, "/multiplier"):
-		parts := strings.Fields(text)
-		if len(parts) == 1 {
-			u, err := t.userRepo.Find(ctx, chatID)
-			if err != nil {
-				_ = t.sendMessage(ctx, chatID, "Ты не подписан. Напиши /start")
-				return
-			}
-			_ = t.sendMessage(ctx, chatID, fmt.Sprintf(
-				"Текущий множитель: <b>x%.1f</b>\n\nЧтобы изменить: /multiplier 5.0",
-				u.VolumeMultiplier,
-			))
+	menuText, kb := settingsMenu(u)
+	_ = t.sendMessage(ctx, chatID, "✅ <b>Bybit Volume Alerter</b>\n\n"+menuText, &kb)
+}
+
+func (t *TelegramNotifier) handleCallback(ctx context.Context, cb *tgCallbackQuery) {
+	_ = t.answerCallback(ctx, cb.ID)
+
+	chatID := cb.From.ID
+	msgID := cb.Message.MessageID
+
+	u, err := t.userRepo.Find(ctx, chatID)
+	if err != nil {
+		_ = t.editMessage(ctx, chatID, msgID, "Ты не подписан. Напиши /start", nil)
+		return
+	}
+
+	switch {
+	case cb.Data == "settings":
+		text, kb := settingsMenu(u)
+		_ = t.editMessage(ctx, chatID, msgID, text, &kb)
+
+	case cb.Data == "mult":
+		text, kb := multMenu(u.VolumeMultiplier)
+		_ = t.editMessage(ctx, chatID, msgID, text, &kb)
+
+	case cb.Data == "days":
+		text, kb := daysMenu(u.LookbackDays)
+		_ = t.editMessage(ctx, chatID, msgID, text, &kb)
+
+	case strings.HasPrefix(cb.Data, "mult:"):
+		var mult int
+		if n, _ := fmt.Sscanf(cb.Data[5:], "%d", &mult); n != 1 || mult <= 0 {
 			return
 		}
-		var mult float64
-		if _, err := fmt.Sscanf(parts[1], "%f", &mult); err != nil || mult <= 0 {
-			_ = t.sendMessage(ctx, chatID, "❌ Некорректное значение. Пример: /multiplier 5.0")
-			return
-		}
-		u := user.New(chatID, mult)
+		u.VolumeMultiplier = float64(mult)
 		if err := t.userRepo.Upsert(ctx, u); err != nil {
-			slog.Error("bot: upsert user multiplier", "error", err)
+			slog.Error("bot: upsert multiplier", "error", err)
 			return
 		}
-		slog.Info("user updated multiplier", "chatID", chatID, "multiplier", mult)
-		_ = t.sendMessage(ctx, chatID, fmt.Sprintf("✅ Множитель обновлён: <b>x%.1f</b>", mult))
+		slog.Info("user updated multiplier", "chatID", chatID, "mult", mult)
+		text, kb := settingsMenu(u)
+		_ = t.editMessage(ctx, chatID, msgID, text, &kb)
 
-	case text == "/stop":
+	case strings.HasPrefix(cb.Data, "days:"):
+		var days int
+		if n, _ := fmt.Sscanf(cb.Data[5:], "%d", &days); n != 1 || days <= 0 {
+			return
+		}
+		u.LookbackDays = days
+		if err := t.userRepo.Upsert(ctx, u); err != nil {
+			slog.Error("bot: upsert lookback", "error", err)
+			return
+		}
+		slog.Info("user updated lookback", "chatID", chatID, "days", days)
+		text, kb := settingsMenu(u)
+		_ = t.editMessage(ctx, chatID, msgID, text, &kb)
+
+	case cb.Data == "stop":
 		if err := t.userRepo.Delete(ctx, chatID); err != nil {
 			slog.Error("bot: delete user", "error", err)
 			return
 		}
 		slog.Info("user unsubscribed", "chatID", chatID)
-		_ = t.sendMessage(ctx, chatID, "👋 Отписан. Напиши /start чтобы вернуться.")
+		_ = t.editMessage(ctx, chatID, msgID, "👋 Отписан. Напиши /start чтобы вернуться.", nil)
 	}
 }
 
 // --- HTTP helpers ---
 
-func (t *TelegramNotifier) sendMessage(ctx context.Context, chatID int64, text string) error {
-	body, _ := json.Marshal(map[string]any{
+func (t *TelegramNotifier) sendMessage(ctx context.Context, chatID int64, text string, kb *inlineKeyboard) error {
+	payload := map[string]any{
 		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "HTML",
-	})
+	}
+	if kb != nil {
+		payload["reply_markup"] = kb
+	}
+	return t.post(ctx, "sendMessage", payload)
+}
+
+func (t *TelegramNotifier) editMessage(ctx context.Context, chatID int64, msgID int64, text string, kb *inlineKeyboard) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": msgID,
+		"text":       text,
+		"parse_mode": "HTML",
+	}
+	if kb != nil {
+		payload["reply_markup"] = kb
+	}
+	return t.post(ctx, "editMessageText", payload)
+}
+
+func (t *TelegramNotifier) answerCallback(ctx context.Context, id string) error {
+	return t.post(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id})
+}
+
+func (t *TelegramNotifier) post(ctx context.Context, method string, payload any) error {
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", t.token),
+		fmt.Sprintf("https://api.telegram.org/bot%s/%s", t.token, method),
 		bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -216,19 +345,19 @@ func (t *TelegramNotifier) sendMessage(ctx context.Context, chatID int64, text s
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram API %d: %s", resp.StatusCode, string(b))
+		return fmt.Errorf("telegram %s %d: %s", method, resp.StatusCode, string(b))
 	}
 	return nil
 }
 
-func (t *TelegramNotifier) formatMessage(c exchange.Candle, avg float64) string {
+func (t *TelegramNotifier) formatAlert(p userPayload) string {
 	tag := "в моменте"
-	if c.IsClosed {
+	if p.candle.IsClosed {
 		tag = "закрытая свеча"
 	}
 	return fmt.Sprintf(
 		"🚨 <b>%s</b>\nОборот: %s USDT\nСреднее за %d дн.: %s USDT\nРатио: x%.2f\n<i>%s</i>",
-		c.Symbol, fmtVol(c.Turnover), t.lookbackDays, fmtVol(avg), c.Turnover/avg, tag,
+		p.candle.Symbol, fmtVol(p.candle.Turnover), p.lookbackDays, fmtVol(p.avg), p.candle.Turnover/p.avg, tag,
 	)
 }
 

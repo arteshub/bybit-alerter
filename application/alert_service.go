@@ -12,7 +12,7 @@ import (
 
 // Sender delivers an alert to a specific Telegram chat.
 type Sender interface {
-	SendToUser(ctx context.Context, chatID int64, candle exchange.Candle, avg float64) error
+	SendToUser(ctx context.Context, chatID int64, candle exchange.Candle, avg float64, lookbackDays int) error
 }
 
 type firedKey struct {
@@ -22,7 +22,7 @@ type firedKey struct {
 }
 
 // AlertService orchestrates per-user spike detection.
-// Each user has their own VolumeMultiplier; alerts fire independently.
+// Each user has their own VolumeMultiplier and LookbackDays; alerts fire independently.
 type AlertService struct {
 	users  user.Repository
 	store  *store.VolumeStore
@@ -43,14 +43,8 @@ func NewAlertService(users user.Repository, store *store.VolumeStore, sender Sen
 
 // Handle is called on every WebSocket kline update.
 func (s *AlertService) Handle(ctx context.Context, candle exchange.Candle) {
-	avg, ok := s.store.Get(candle.Symbol)
-	if !ok {
-		return
-	}
-
 	prev, hadPrev := s.store.SwapTurnover(candle.Symbol, candle.Turnover)
 	if !hadPrev {
-		// First update — record baseline only, no alerts.
 		return
 	}
 
@@ -61,9 +55,12 @@ func (s *AlertService) Handle(ctx context.Context, candle exchange.Candle) {
 	}
 
 	for _, u := range all {
-		threshold := avg * u.VolumeMultiplier
+		avg, ok := s.store.GetAvg(candle.Symbol, u.LookbackDays)
+		if !ok {
+			continue
+		}
 
-		// Only fire on the exact crossing moment: was below, now above.
+		threshold := avg * u.VolumeMultiplier
 		if prev >= threshold || candle.Turnover < threshold {
 			continue
 		}
@@ -87,9 +84,10 @@ func (s *AlertService) Handle(ctx context.Context, candle exchange.Candle) {
 			"ratio", candle.Turnover/avg,
 			"chatID", u.ChatID,
 			"multiplier", u.VolumeMultiplier,
+			"lookbackDays", u.LookbackDays,
 		)
 
-		if err := s.sender.SendToUser(ctx, u.ChatID, candle, avg); err != nil {
+		if err := s.sender.SendToUser(ctx, u.ChatID, candle, avg, u.LookbackDays); err != nil {
 			slog.Error("alert: send failed", "chatID", u.ChatID, "error", err)
 		}
 	}

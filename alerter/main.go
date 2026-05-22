@@ -49,7 +49,7 @@ func main() {
 	userRepo := pgrepo.NewUserRepository(db)
 	vs := store.NewVolumeStore()
 	client := exchange.NewBybitClient(cfg.RESTDelayMS)
-	notifier := notify.NewTelegramNotifier(cfg.TGBotToken, cfg.LookbackDays, cfg.VolumeMultiplier, userRepo)
+	notifier := notify.NewTelegramNotifier(cfg.TGBotToken, cfg.VolumeMultiplier, userRepo)
 	alertSvc := application.NewAlertService(userRepo, vs, notifier)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -92,13 +92,10 @@ func main() {
 			}
 
 			added, removed := diffSymbols(currentSymbols, newSymbols)
-
 			for _, sym := range removed {
 				vs.Delete(sym)
 			}
-
 			loadAverages(ctx, client, vs, newSymbols, cfg)
-
 			if len(added) > 0 {
 				if err := client.AddSubscriptions(ctx, added, candleHandler); err != nil {
 					slog.Error("daily update: add subscriptions failed", "error", err)
@@ -129,11 +126,13 @@ func loadAverages(ctx context.Context, client *exchange.BybitClient, vs *store.V
 		if ctx.Err() != nil {
 			return
 		}
-		avg, err := client.FetchAvgTurnover(ctx, sym, cfg.LookbackDays)
+		avgs, err := client.FetchMultiAvgTurnover(ctx, sym)
 		if err != nil {
 			slog.Warn("fetch avg failed, skipping", "symbol", sym, "error", err)
 		} else {
-			vs.Set(sym, avg)
+			for days, avg := range avgs {
+				vs.SetAvg(sym, days, avg)
+			}
 		}
 		if (i+1)%50 == 0 || i+1 == total {
 			slog.Info("loading averages", "progress", fmt.Sprintf("%d/%d", i+1, total))

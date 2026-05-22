@@ -13,6 +13,7 @@ import (
 type userModel struct {
 	ChatID           int64     `gorm:"primaryKey"`
 	VolumeMultiplier float64   `gorm:"not null;default:3.0"`
+	LookbackDays     int       `gorm:"not null;default:90"`
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -35,11 +36,12 @@ func (r *UserRepository) Upsert(ctx context.Context, u *user.User) error {
 	m := userModel{
 		ChatID:           u.ChatID,
 		VolumeMultiplier: u.VolumeMultiplier,
+		LookbackDays:     u.LookbackDays,
 	}
 	return r.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "chat_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"volume_multiplier", "updated_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"volume_multiplier", "lookback_days", "updated_at"}),
 		}).
 		Create(&m).Error
 }
@@ -72,6 +74,7 @@ func toEntity(m userModel) *user.User {
 	return &user.User{
 		ChatID:           m.ChatID,
 		VolumeMultiplier: m.VolumeMultiplier,
+		LookbackDays:     m.LookbackDays,
 		CreatedAt:        m.CreatedAt,
 		UpdatedAt:        m.UpdatedAt,
 	}

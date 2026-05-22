@@ -10,7 +10,6 @@ type Config struct {
 	TGBotToken       string
 	DatabaseURL      string
 	VolumeMultiplier float64
-	LookbackDays     int
 	RESTDelayMS      int
 	Env              string
 }
@@ -18,7 +17,6 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		VolumeMultiplier: 3.0,
-		LookbackDays:     90,
 		RESTDelayMS:      50,
 		Env:              os.Getenv("ENV"),
 	}
@@ -41,14 +39,6 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("VOLUME_MULTIPLIER invalid: %w", err)
 		}
 		cfg.VolumeMultiplier = m
-	}
-
-	if v := os.Getenv("LOOKBACK_DAYS"); v != "" {
-		d, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("LOOKBACK_DAYS invalid: %w", err)
-		}
-		cfg.LookbackDays = d
 	}
 
 	if v := os.Getenv("REST_DELAY_MS"); v != "" {

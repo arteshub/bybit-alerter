@@ -82,35 +82,37 @@ func (b *BybitClient) FetchSymbols(ctx context.Context) ([]Symbol, error) {
 	return symbols, nil
 }
 
-// FetchAvgTurnover returns the arithmetic mean daily turnover over the last
-// [days] closed candles. Retries up to 3 times on error (1s, 2s, 4s).
-func (b *BybitClient) FetchAvgTurnover(ctx context.Context, sym Symbol, days int) (float64, error) {
+// SupportedPeriods are the lookback periods (days) available to users.
+var SupportedPeriods = []int{30, 60, 90}
+
+// FetchMultiAvgTurnover fetches one batch of klines and returns average daily
+// turnover for each period in SupportedPeriods. Retries up to 3 times on error.
+func (b *BybitClient) FetchMultiAvgTurnover(ctx context.Context, sym Symbol) (map[int]float64, error) {
 	delays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
 	var lastErr error
 	for attempt := 0; attempt <= len(delays); attempt++ {
 		if attempt > 0 {
-			slog.Warn("retrying FetchAvgTurnover", "symbol", sym, "error", lastErr, "attempt", attempt)
+			slog.Warn("retrying FetchMultiAvgTurnover", "symbol", sym, "error", lastErr, "attempt", attempt)
 			select {
 			case <-time.After(delays[attempt-1]):
 			case <-ctx.Done():
-				return 0, ctx.Err()
+				return nil, ctx.Err()
 			}
 		}
 
-		avg, err := b.fetchAvgTurnoverOnce(sym, days)
+		result, err := b.fetchMultiAvgOnce(sym)
 		if err == nil {
-			return avg, nil
+			return result, nil
 		}
-		// No point retrying if the symbol simply has no historical data yet.
 		var noData errNoData
 		if errors.As(err, &noData) {
-			return 0, err
+			return nil, err
 		}
 		lastErr = err
 	}
 
-	return 0, fmt.Errorf("%s: after %d retries: %w", sym, len(delays), lastErr)
+	return nil, fmt.Errorf("%s: after %d retries: %w", sym, len(delays), lastErr)
 }
 
 // errNoData is returned when there are no closed candles available (not retryable).
@@ -118,8 +120,9 @@ type errNoData struct{ sym Symbol }
 
 func (e errNoData) Error() string { return string(e.sym) + ": no closed candle data available" }
 
-func (b *BybitClient) fetchAvgTurnoverOnce(sym Symbol, days int) (float64, error) {
-	limit := days + 1 // +1 because the first item is the current unclosed candle
+func (b *BybitClient) fetchMultiAvgOnce(sym Symbol) (map[int]float64, error) {
+	maxDays := SupportedPeriods[len(SupportedPeriods)-1]
+	limit := maxDays + 1
 	resp, err := b.rest.V5().Market().GetKline(bybit.V5GetKlineParam{
 		Category: bybit.CategoryV5Linear,
 		Symbol:   bybit.SymbolV5(sym),
@@ -127,28 +130,34 @@ func (b *BybitClient) fetchAvgTurnoverOnce(sym Symbol, days int) (float64, error
 		Limit:    &limit,
 	})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	list := resp.Result.List
 	if len(list) < 2 {
-		// New listing with no closed candles yet — not a transient error, skip immediately.
-		return 0, errNoData{sym}
+		return nil, errNoData{sym}
 	}
 
-	// list[0] is the current (possibly unclosed) candle – discard it.
-	// Use however many closed candles are available (may be fewer than days for new listings).
+	// list[0] is the current (unclosed) candle — discard. list is newest-first.
 	closed := list[1:]
-	var sum float64
-	for _, item := range closed {
-		t, err := strconv.ParseFloat(item.Turnover, 64)
-		if err != nil {
-			return 0, fmt.Errorf("parse turnover %q: %w", item.Turnover, err)
-		}
-		sum += t
-	}
 
-	return sum / float64(len(closed)), nil
+	result := make(map[int]float64, len(SupportedPeriods))
+	for _, days := range SupportedPeriods {
+		n := days
+		if n > len(closed) {
+			n = len(closed)
+		}
+		var sum float64
+		for _, item := range closed[:n] {
+			t, err := strconv.ParseFloat(item.Turnover, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse turnover %q: %w", item.Turnover, err)
+			}
+			sum += t
+		}
+		result[days] = sum / float64(n)
+	}
+	return result, nil
 }
 
 // Subscribe opens WebSocket connections for all symbols and calls handler on
