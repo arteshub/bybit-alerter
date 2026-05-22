@@ -15,9 +15,10 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 
 	"volume_pump_checker/application"
+	"volume_pump_checker/domain/market"
+	"volume_pump_checker/infrastructure/bybit"
 	pgrepo "volume_pump_checker/infrastructure/postgres"
 	"volume_pump_checker/internal/config"
-	"volume_pump_checker/internal/exchange"
 	"volume_pump_checker/internal/notify"
 	"volume_pump_checker/internal/store"
 )
@@ -28,13 +29,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	var logHandler slog.Handler
-	if cfg.Env == "production" {
-		logHandler = slog.NewJSONHandler(os.Stdout, nil)
-	} else {
-		logHandler = slog.NewTextHandler(os.Stdout, nil)
-	}
-	slog.SetDefault(slog.New(logHandler))
+	setupLogger(cfg.Env)
 
 	db, err := gorm.Open(gormpg.Open(cfg.DatabaseURL), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
@@ -48,7 +43,7 @@ func main() {
 
 	userRepo := pgrepo.NewUserRepository(db)
 	vs := store.NewVolumeStore()
-	client := exchange.NewBybitClient(cfg.RESTDelayMS)
+	bybitClient := bybit.NewClient(cfg.RESTDelayMS)
 	notifier := notify.NewTelegramNotifier(cfg.TGBotToken, cfg.VolumeMultiplier, userRepo)
 	alertSvc := application.NewAlertService(userRepo, vs, notifier)
 
@@ -58,75 +53,48 @@ func main() {
 	notifier.Start(ctx)
 
 	slog.Info("fetching symbols")
-	symbols, err := client.FetchSymbols(ctx)
+	symbols, err := bybitClient.FetchSymbols(ctx)
 	if err != nil {
 		log.Fatalf("fetch symbols: %v", err)
 	}
 	slog.Info("symbols fetched", "count", len(symbols))
 
 	loadStart := time.Now()
-	loadAverages(ctx, client, vs, symbols, cfg)
+	loadAverages(ctx, bybitClient, vs, symbols, cfg.RESTDelayMS)
 	slog.Info("averages loaded", "count", len(symbols), "duration", time.Since(loadStart).Round(time.Second))
 
-	candleHandler := func(candle exchange.Candle) {
+	candleHandler := func(candle market.Candle) {
 		alertSvc.Handle(ctx, candle)
 	}
 
-	currentSymbols := symbols
-
-	go func() {
-		for {
-			now := time.Now().UTC()
-			next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
-			select {
-			case <-time.After(time.Until(next)):
-			case <-ctx.Done():
-				return
-			}
-
-			start := time.Now()
-			newSymbols, err := client.FetchSymbols(ctx)
-			if err != nil {
-				slog.Error("daily update: fetch symbols failed", "error", err)
-				continue
-			}
-
-			added, removed := diffSymbols(currentSymbols, newSymbols)
-			for _, sym := range removed {
-				vs.Delete(sym)
-			}
-			loadAverages(ctx, client, vs, newSymbols, cfg)
-			if len(added) > 0 {
-				if err := client.AddSubscriptions(ctx, added, candleHandler); err != nil {
-					slog.Error("daily update: add subscriptions failed", "error", err)
-				}
-			}
-
-			slog.Info("daily update complete",
-				"duration", time.Since(start).Round(time.Second),
-				"added", len(added),
-				"removed", len(removed),
-			)
-			currentSymbols = newSymbols
-		}
-	}()
-
-	if err := client.Subscribe(ctx, symbols, candleHandler); err != nil {
+	if err := bybitClient.Subscribe(ctx, symbols, candleHandler); err != nil {
 		log.Fatalf("subscribe: %v", err)
 	}
 
+	go runDailyRefresh(ctx, bybitClient, vs, candleHandler, symbols, cfg.RESTDelayMS)
+
 	slog.Info("service started")
-	client.Start(ctx, nil)
+	bybitClient.Wait()
 	slog.Info("service stopped")
 }
 
-func loadAverages(ctx context.Context, client *exchange.BybitClient, vs *store.VolumeStore, symbols []exchange.Symbol, cfg *config.Config) {
+func setupLogger(env string) {
+	var h slog.Handler
+	if env == "production" {
+		h = slog.NewJSONHandler(os.Stdout, nil)
+	} else {
+		h = slog.NewTextHandler(os.Stdout, nil)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
+func loadAverages(ctx context.Context, c *bybit.Client, vs *store.VolumeStore, symbols []market.Symbol, delayMS int) {
 	total := len(symbols)
 	for i, sym := range symbols {
 		if ctx.Err() != nil {
 			return
 		}
-		avgs, err := client.FetchMultiAvgTurnover(ctx, sym)
+		avgs, err := c.FetchMultiAvgTurnover(ctx, sym)
 		if err != nil {
 			slog.Warn("fetch avg failed, skipping", "symbol", sym, "error", err)
 		} else {
@@ -137,16 +105,53 @@ func loadAverages(ctx context.Context, client *exchange.BybitClient, vs *store.V
 		if (i+1)%50 == 0 || i+1 == total {
 			slog.Info("loading averages", "progress", fmt.Sprintf("%d/%d", i+1, total))
 		}
-		time.Sleep(time.Duration(cfg.RESTDelayMS) * time.Millisecond)
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
 	}
 }
 
-func diffSymbols(old, new []exchange.Symbol) (added, removed []exchange.Symbol) {
-	oldSet := make(map[exchange.Symbol]struct{}, len(old))
+func runDailyRefresh(ctx context.Context, c *bybit.Client, vs *store.VolumeStore, handler func(market.Candle), current []market.Symbol, delayMS int) {
+	for {
+		now := time.Now().UTC()
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 5, 0, 0, time.UTC)
+		select {
+		case <-time.After(time.Until(next)):
+		case <-ctx.Done():
+			return
+		}
+
+		start := time.Now()
+		fresh, err := c.FetchSymbols(ctx)
+		if err != nil {
+			slog.Error("daily refresh: fetch symbols", "error", err)
+			continue
+		}
+
+		added, removed := diffSymbols(current, fresh)
+		for _, sym := range removed {
+			vs.Delete(sym)
+		}
+		loadAverages(ctx, c, vs, fresh, delayMS)
+		if len(added) > 0 {
+			if err := c.AddSubscriptions(ctx, added, handler); err != nil {
+				slog.Error("daily refresh: add subscriptions", "error", err)
+			}
+		}
+
+		slog.Info("daily refresh complete",
+			"duration", time.Since(start).Round(time.Second),
+			"added", len(added),
+			"removed", len(removed),
+		)
+		current = fresh
+	}
+}
+
+func diffSymbols(old, new []market.Symbol) (added, removed []market.Symbol) {
+	oldSet := make(map[market.Symbol]struct{}, len(old))
 	for _, s := range old {
 		oldSet[s] = struct{}{}
 	}
-	newSet := make(map[exchange.Symbol]struct{}, len(new))
+	newSet := make(map[market.Symbol]struct{}, len(new))
 	for _, s := range new {
 		newSet[s] = struct{}{}
 	}

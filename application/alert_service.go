@@ -5,45 +5,49 @@ import (
 	"log/slog"
 	"sync"
 
+	"volume_pump_checker/domain/market"
 	"volume_pump_checker/domain/user"
-	"volume_pump_checker/internal/exchange"
-	"volume_pump_checker/internal/store"
 )
 
-// Sender delivers an alert to a specific Telegram chat.
+// Sender delivers an alert to a specific chat.
 type Sender interface {
-	SendToUser(ctx context.Context, chatID int64, candle exchange.Candle, avg float64, lookbackDays int) error
+	SendToUser(ctx context.Context, chatID int64, candle market.Candle, avg float64, lookbackDays int) error
+}
+
+// VolumeCache is a read/write cache of per-symbol turnover data.
+type VolumeCache interface {
+	GetAvg(sym market.Symbol, days int) (float64, bool)
+	SwapTurnover(sym market.Symbol, current float64) (prev float64, ok bool)
 }
 
 type firedKey struct {
 	chatID int64
-	sym    exchange.Symbol
+	sym    market.Symbol
 	date   string
 }
 
 // AlertService orchestrates per-user spike detection.
-// Each user has their own VolumeMultiplier and LookbackDays; alerts fire independently.
 type AlertService struct {
 	users  user.Repository
-	store  *store.VolumeStore
+	cache  VolumeCache
 	sender Sender
 
 	mu    sync.Mutex
 	fired map[firedKey]struct{}
 }
 
-func NewAlertService(users user.Repository, store *store.VolumeStore, sender Sender) *AlertService {
+func NewAlertService(users user.Repository, cache VolumeCache, sender Sender) *AlertService {
 	return &AlertService{
 		users:  users,
-		store:  store,
+		cache:  cache,
 		sender: sender,
 		fired:  make(map[firedKey]struct{}),
 	}
 }
 
 // Handle is called on every WebSocket kline update.
-func (s *AlertService) Handle(ctx context.Context, candle exchange.Candle) {
-	prev, hadPrev := s.store.SwapTurnover(candle.Symbol, candle.Turnover)
+func (s *AlertService) Handle(ctx context.Context, candle market.Candle) {
+	prev, hadPrev := s.cache.SwapTurnover(candle.Symbol, candle.Turnover)
 	if !hadPrev {
 		return
 	}
@@ -55,7 +59,7 @@ func (s *AlertService) Handle(ctx context.Context, candle exchange.Candle) {
 	}
 
 	for _, u := range all {
-		avg, ok := s.store.GetAvg(candle.Symbol, u.LookbackDays)
+		avg, ok := s.cache.GetAvg(candle.Symbol, u.LookbackDays)
 		if !ok {
 			continue
 		}

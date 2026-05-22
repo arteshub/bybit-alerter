@@ -6,17 +6,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"volume_pump_checker/domain/market"
 	"volume_pump_checker/domain/user"
-	"volume_pump_checker/internal/exchange"
 )
 
 type userPayload struct {
 	chatID       int64
-	candle       exchange.Candle
+	candle       market.Candle
 	avg          float64
 	lookbackDays int
 }
 
+// TelegramNotifier delivers alerts and handles bot commands via inline keyboards.
 type TelegramNotifier struct {
 	token       string
 	defaultMult float64
@@ -41,11 +42,10 @@ func (t *TelegramNotifier) Start(ctx context.Context) {
 	go t.pollUpdates(ctx)
 }
 
-func (t *TelegramNotifier) SendToUser(_ context.Context, chatID int64, candle exchange.Candle, avg float64, lookbackDays int) error {
+func (t *TelegramNotifier) SendToUser(_ context.Context, chatID int64, candle market.Candle, avg float64, lookbackDays int) error {
 	select {
 	case t.queue <- userPayload{chatID: chatID, candle: candle, avg: avg, lookbackDays: lookbackDays}:
 	default:
-		// queue full — drop silently, log handled in caller
 	}
 	return nil
 }

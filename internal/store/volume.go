@@ -3,25 +3,25 @@ package store
 import (
 	"sync"
 
-	"volume_pump_checker/internal/exchange"
+	"volume_pump_checker/domain/market"
 )
 
-// VolumeStore is a thread-safe in-memory store for per-symbol multi-period
-// average turnover and per-symbol last-seen intraday turnover.
+// VolumeStore is a thread-safe in-memory cache of per-symbol multi-period
+// average turnover and last-seen intraday turnover.
 type VolumeStore struct {
 	mu           sync.RWMutex
-	avgs         map[exchange.Symbol]map[int]float64
-	lastTurnover map[exchange.Symbol]float64
+	avgs         map[market.Symbol]map[int]float64
+	lastTurnover map[market.Symbol]float64
 }
 
 func NewVolumeStore() *VolumeStore {
 	return &VolumeStore{
-		avgs:         make(map[exchange.Symbol]map[int]float64),
-		lastTurnover: make(map[exchange.Symbol]float64),
+		avgs:         make(map[market.Symbol]map[int]float64),
+		lastTurnover: make(map[market.Symbol]float64),
 	}
 }
 
-func (s *VolumeStore) SetAvg(sym exchange.Symbol, days int, avg float64) {
+func (s *VolumeStore) SetAvg(sym market.Symbol, days int, avg float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.avgs[sym] == nil {
@@ -30,7 +30,7 @@ func (s *VolumeStore) SetAvg(sym exchange.Symbol, days int, avg float64) {
 	s.avgs[sym][days] = avg
 }
 
-func (s *VolumeStore) GetAvg(sym exchange.Symbol, days int) (float64, bool) {
+func (s *VolumeStore) GetAvg(sym market.Symbol, days int) (float64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	m, ok := s.avgs[sym]
@@ -41,9 +41,9 @@ func (s *VolumeStore) GetAvg(sym exchange.Symbol, days int) (float64, bool) {
 	return v, ok
 }
 
-// SwapTurnover atomically replaces the stored turnover for sym and returns the
-// previous value. ok=false means this is the first update for this symbol.
-func (s *VolumeStore) SwapTurnover(sym exchange.Symbol, current float64) (prev float64, ok bool) {
+// SwapTurnover atomically replaces the stored turnover and returns the previous value.
+// ok=false on first call for this symbol.
+func (s *VolumeStore) SwapTurnover(sym market.Symbol, current float64) (prev float64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, ok = s.lastTurnover[sym]
@@ -51,7 +51,7 @@ func (s *VolumeStore) SwapTurnover(sym exchange.Symbol, current float64) (prev f
 	return
 }
 
-func (s *VolumeStore) Delete(sym exchange.Symbol) {
+func (s *VolumeStore) Delete(sym market.Symbol) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.avgs, sym)

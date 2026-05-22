@@ -1,4 +1,4 @@
-package exchange
+package market
 
 type Symbol string
 
