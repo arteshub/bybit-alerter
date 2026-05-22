@@ -225,12 +225,12 @@ func (t *TelegramNotifier) sendMessage(ctx context.Context, chatID int64, text s
 }
 
 func (t *TelegramNotifier) formatMessage(c exchange.Candle, avg float64) string {
-	tag := "intraday"
+	tag := "в моменте"
 	if c.IsClosed {
-		tag = "closed"
+		tag = "закрытая свеча"
 	}
 	return fmt.Sprintf(
-		"🚨 <b>%s</b>\nTurnover: %s USDT\n%dd avg: %s USDT\nRatio: x%.2f\n<i>%s</i>",
+		"🚨 <b>%s</b>\nОборот: %s USDT\nСреднее за %d дн.: %s USDT\nРатио: x%.2f\n<i>%s</i>",
 		c.Symbol, fmtVol(c.Turnover), t.lookbackDays, fmtVol(avg), c.Turnover/avg, tag,
 	)
 }
